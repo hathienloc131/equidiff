@@ -73,9 +73,9 @@ class EquivariantObsEnc(ModuleAttrMixin):
         
     def forward(self, nobs):
         obs = nobs["agentview_image"]
-        ee_pos = nobs["robot0_eef_pos"]
-        ee_quat = nobs["robot0_eef_quat"]
-        ee_q = nobs["robot0_gripper_qpos"]
+        ee_pos = nobs["robot0_eef_pos"] # 3
+        ee_quat = nobs["robot0_eef_quat"] # 4
+        ee_q = nobs["robot0_gripper_qpos"] # 2
         ih = nobs["robot0_eye_in_hand_image"]
         # B, T, C, H, W
         batch_size = obs.shape[0]
@@ -91,23 +91,23 @@ class EquivariantObsEnc(ModuleAttrMixin):
 
         enc_out = self.enc_obs(obs).tensor.reshape(batch_size * t, -1)  # b d
         ih_out = self.enc_ih(ih)
-        pos_xy = ee_pos[:, 0:2]
-        pos_z = ee_pos[:, 2:3]
+        pos_xy = ee_pos[:, 0:2] # 2
+        pos_z = ee_pos[:, 2:3] # 1
         features = torch.cat(
             [
                 enc_out,
                 ih_out,
-                pos_xy,
+                pos_xy, # 2
                 # ee_rot is the first two rows of the rotation matrix (i.e., the rotation 6D repr.)
                 # each column vector in the first two rows of the rotation 6d forms a rho1 vector
-                ee_rot[:, 0:1],
-                ee_rot[:, 3:4],
-                ee_rot[:, 1:2],
-                ee_rot[:, 4:5],
-                ee_rot[:, 2:3],
-                ee_rot[:, 5:6],
-                pos_z,
-                ee_q,
+                ee_rot[:, 0:1], # 1
+                ee_rot[:, 3:4], # 1
+                ee_rot[:, 1:2], # 1
+                ee_rot[:, 4:5], # 1
+                ee_rot[:, 2:3], # 1
+                ee_rot[:, 5:6], # 1
+                pos_z, # 1
+                ee_q, # 2
             ],
             dim=1
         )
