@@ -150,6 +150,9 @@ def build_ACT_equi_model_and_optimizer(args_override):
             "lr": args.lr_backbone,
         },
     ]
+    
+    for n, p in model.named_parameters():
+        print(n)
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
 

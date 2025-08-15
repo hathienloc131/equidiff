@@ -75,7 +75,7 @@ class EquivariantEncoder(ModuleAttrMixin):
         # data is in xyzw, but rotation transformer takes wxyz
         return self.quaternion_to_sixd.forward(quat[:, [3, 0, 1, 2]]) 
     
-    def forward(self, obs, action):
+    def forward(self, obs, action, is_pad=None):
         batch_size = action.shape[0]
         t = action.shape[1]
 
@@ -95,7 +95,7 @@ class EquivariantEncoder(ModuleAttrMixin):
         encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)
         # do not mask cls token
         cls_joint_is_pad = torch.full((batch_size, 1 + self.N), False).to(joint_embed.device) # False: not a padding
-        is_pad = torch.cat([cls_joint_is_pad, torch.full((batch_size, t * self.N), True).to(joint_embed.device)], axis=1)  # (bs, seq+1)
+        is_pad = torch.cat([cls_joint_is_pad, is_pad.repeat(1, self.N)], axis=1)  # (bs, seq+1)
         # obtain position embedding
         pos_embed = self.pos_table.clone().detach()
         pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
@@ -183,12 +183,18 @@ class EquivariantDecoder(ModuleAttrMixin):
         self.image_group = gspaces.rot2dOnR2(N)
         hidden_dim = transformer.d_model
         self.token_type = enn.FieldType(self.group, hidden_dim * [self.group.regular_repr])
-        
+        self.query_type = enn.FieldType(self.group, hidden_dim * [self.group.trivial_repr])
         self.action_head = enn.Linear(
             self.token_type
             , self.getOutFieldType())
  
-        self.query_embed = nn.Embedding(num_queries * N, hidden_dim)
+
+        # Better: Make query embeddings equivariant
+        self.query_embed_base = nn.Embedding(num_queries, hidden_dim)
+        self.query_proj = enn.Linear(
+            self.query_type,
+            self.token_type
+        )
 
         self.backbones = nn.ModuleList(backbones)
         self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
@@ -252,7 +258,13 @@ class EquivariantDecoder(ModuleAttrMixin):
         src = torch.cat(all_cam_features, axis=3)
         pos = torch.cat(all_cam_pos, axis=3)
         latent_input = latent_input.unsqueeze(1)
-        hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+        query_embed = self.query_proj(
+            enn.GeometricTensor(self.query_embed_base.weight, self.query_type)
+        ).tensor
+        
+        query_embed = rearrange(query_embed, "b (n d) -> (b n) d", b=query_embed.shape[0], n=self.N) # (bs* N, hidden_dim)
+        
+        hs = self.transformer(src, None, query_embed, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
         hs = rearrange(hs, "b (t n) d -> (b t) (n d)", b=bs, n=self.N) # (bs * N, hidden_dim)
         hs = enn.GeometricTensor(hs, self.token_type) 
         a_hat = self.action_head(hs)
@@ -348,7 +360,7 @@ class DETRVAE(nn.Module):
         bs, *_ = image.shape
         ### Obtain latent z from action sequence
         if is_training:
-            latent_sample, mu, logvar, is_pad = self.equivariant_encoder(qpos, action=actions)
+            latent_sample, mu, logvar, is_pad = self.equivariant_encoder(qpos, action=actions, is_pad=is_pad)
             latent_input = self.latent_out_proj(latent_sample)
         else:
             mu = logvar = None

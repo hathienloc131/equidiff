@@ -68,7 +68,15 @@ The downloaded dataset has a relative action space. To train with absolute actio
 python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/[dataset]/[dataset].hdf5 -o data/robomimic/datasets/[dataset]/[dataset]_abs.hdf5 -n [n_worker]
 # Replace [dataset] and [n_worker] with your choices.
 # E.g., convert stack_d1 (non-voxel) with 12 workers
-python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/stack_d1/stack_d1_voxel.hdf5 -o data/robomimic/datasets/stack_d1/stack_d1_abs.hdf5 -n 12
+python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/stack_d1/stack_d1.hdf5 -o data/robomimic/datasets/stack_d1/stack_d1_abs.hdf5 -n 12
+
+python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/coffee_d0/coffee_d0.hdf5 -o data/robomimic/datasets/coffee_d0/coffee_d0_abs.hdf5 -n 12
+python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/coffee_d2/coffee_d2.hdf5 -o data/robomimic/datasets/coffee_d2/coffee_d2_abs.hdf5 -n 12
+
+python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/stack_three_d0/stack_three_d0.hdf5 -o data/robomimic/datasets/stack_three_d0/stack_three_d0_abs.hdf5 -n 12
+python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/stack_three_d1/stack_three_d1.hdf5 -o data/robomimic/datasets/stack_three_d1/stack_three_d1_abs.hdf5 -n 12
+
+python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/pick_place_d0/pick_place_d0.hdf5 -o data/robomimic/datasets/pick_place_d0/pick_place_d0_abs.hdf5 -n 12
 # E.g., convert stack_d1_voxel (voxel) with 12 workers
 python equi_diffpo/scripts/robomimic_dataset_conversion.py -i data/robomimic/datasets/stack_d1/stack_d1_voxel.hdf5 -o data/robomimic/datasets/stack_d1/stack_d1_voxel_abs.hdf5 -n 12
 ```
@@ -78,6 +86,12 @@ To train Equivariant Diffusion Policy (with absolute pose control) in Stack D1 t
 ```bash
 # Make sure you have the non-voxel converted dataset with absolute action space from the previous step 
 python train.py --config-name=train_equi_diffusion_unet_abs task_name=stack_d1 n_demo=100
+
+python train.py --config-name=train_equi_diffusion_unet_abs task_name=coffee_d2 n_demo=100
+python train.py --config-name=train_act_abs task_name=coffee_d2 n_demo=100
+python train.py --config-name=train_equi_diffusion_unet_abs task_name=stack_three_d0 n_demo=100
+python train.py --config-name=train_equi_diffusion_unet_abs task_name=pick_place_d0 n_demo=100
+
 ```
 To train with relative pose control instead:
 ```bash

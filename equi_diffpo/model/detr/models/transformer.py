@@ -58,7 +58,7 @@ class Transformer(nn.Module):
 
             additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
-            if len(latent_input.shape) == len(proprio_input.shape):
+            if len(latent_input.shape) == len(proprio_input.shape) == 3:
                 addition_input = torch.cat([latent_input, proprio_input], axis=1)
                 addition_input = addition_input.permute(1, 0, 2)
             else:

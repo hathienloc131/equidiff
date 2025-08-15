@@ -2,7 +2,7 @@ defaults:
   - _self_
   - task: mimicgen_abs
 
-name: act
+name: act_equi
 _target_: equi_diffpo.workspace.train_act_equi_workspace.TrainActEquiWorkspace
 
 shape_meta: ${task.shape_meta}
@@ -45,7 +45,7 @@ val_dataloader:
   persistent_workers: True
 
 training:
-  device: "cuda:0"
+  device: "cuda:1"
   seed: 0
   debug: False
   resume: True
@@ -61,7 +61,7 @@ logging:
   project: diffusion_policy_${task_name}
   resume: True
   mode: online
-  name: act_demo${n_demo}
+  name: act_equi_2_demo${n_demo}
   tags: ["${name}", "${task_name}", "${exp_name}"]
   id: null
   group: null
