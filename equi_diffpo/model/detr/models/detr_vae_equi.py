@@ -2,15 +2,15 @@
 """
 DETR model and criterion classes.
 """
+from matplotlib.pyplot import axis
 import torch
 from torch import nn
 from torch.autograd import Variable
 from einops import rearrange
-from escnn import gspaces, enn
+from escnn import gspaces, nn as enn
 from escnn.group import CyclicGroup
-from .backbone import build_backbone
+from .backbone import build_backbone, build_backbone_equi
 from .transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer
-from equi_diffpo.model.equi.equi_encoder import EquivariantResEncoder76Cyclic
 from equi_diffpo.model.common.module_attr_mixin import ModuleAttrMixin
 from equi_diffpo.model.common.rotation_transformer import RotationTransformer
 
@@ -39,6 +39,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 class EquivariantEncoder(ModuleAttrMixin):
     def __init__(self,
         encoder,
+        num_queries=1,
         hidden_dim=128,
         final_dim=32,
         N=8,
@@ -46,6 +47,7 @@ class EquivariantEncoder(ModuleAttrMixin):
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.final_dim = final_dim
         self.N = N
         self.initialize = initialize
         self.group = gspaces.no_base_space(CyclicGroup(self.N))
@@ -57,11 +59,7 @@ class EquivariantEncoder(ModuleAttrMixin):
         self.cls_embed = nn.Embedding(1, self.hidden_dim)
         
         self.encoder_joint_proj = enn.Linear(
-            enn.FieldType(
-                self.group,
-                4 * [self.group.irrep(1)] # pos, rot 4 * 2
-                + 3 * [self.group.trivial_repr], # gripper (2) 2, z zpos 1
-            ),
+            self.getJointFieldType(),
             self.token_type,
         )
         self.encoder_action_proj = enn.Linear(
@@ -70,35 +68,233 @@ class EquivariantEncoder(ModuleAttrMixin):
         )
         
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
+        self.latent_proj = nn.Linear(hidden_dim, self.final_dim*2) # project hidden state to latent std, var
         
+        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+N * (1+num_queries), hidden_dim)) # [CLS], qpos, a_seq
     def get6DRotation(self, quat):
         # data is in xyzw, but rotation transformer takes wxyz
         return self.quaternion_to_sixd.forward(quat[:, [3, 0, 1, 2]]) 
     
     def forward(self, obs, action):
-        ee_pos = obs['robot0_eef_pos'] # (bs, t, 3)
-        ee_quat = obs['robot0_eef_quat'] # (bs, t, 4)
-        ee_q = obs["robot0_gripper_qpos"] # (bs, t, 2)
+        batch_size = action.shape[0]
+        t = action.shape[1]
 
-        batch_size = ee_pos.shape[0]
-        t = ee_pos.shape[1]
+        joint_features = self.getJointGeometricTensor(obs) # (bs, 8)
+        joint_embed = self.encoder_joint_proj(joint_features).tensor # (bs, n * hidden_dim)
+        joint_embed = rearrange(joint_embed, "b (n d) -> b n d", b=batch_size, n=self.N) # (bs, t * N, hidden_dim)
         
-        ee_pos = rearrange(ee_pos, "b t d -> (b t) d")
-        ee_quat = rearrange(ee_quat, "b t d -> (b t) d")
-        ee_q = rearrange(ee_q, "b t d -> (b t) d")
+        action_features = self.getActionGeometricTensor(action)
+        action_embed = self.encoder_action_proj(action_features).tensor  # (bs*t, hidden_dim)
+        action_embed = rearrange(action_embed, "(b t) (n d) -> b (t n) d", b=batch_size, t=t, n=self.N) # (bs, t * N, hidden_dim)
 
-        ee_rot = self.get6DRotation(ee_quat)
+        # cls token
+        cls_embed = self.cls_embed.weight # (1, hidden_dim)
+        cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(batch_size, 1, 1) # (bs, 1, hidden_dim)
+        encoder_input = torch.cat([cls_embed, joint_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)
+        
+        encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)
+        # do not mask cls token
+        cls_joint_is_pad = torch.full((batch_size, 1 + self.N), False).to(joint_embed.device) # False: not a padding
+        is_pad = torch.cat([cls_joint_is_pad, torch.full((batch_size, t * self.N), True).to(joint_embed.device)], axis=1)  # (bs, seq+1)
+        # obtain position embedding
+        pos_embed = self.pos_table.clone().detach()
+        pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
+        # query model
+        encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
+        encoder_output = encoder_output[0] # take cls output only
+        latent_info = self.latent_proj(encoder_output)
+        mu = latent_info[:, :self.final_dim]
+        logvar = latent_info[:, self.final_dim:]
+        latent_sample = reparametrize(mu, logvar)
+    
+        return latent_sample, mu, logvar, is_pad
 
+    def getJointFieldType(self):
+        return enn.FieldType(
+            self.group,
+            4 * [self.group.irrep(1)] # pos 3, rot 6
+            + 3 * [self.group.trivial_repr], # gripper 1
+        )
+        
     def getOutFieldType(self):
         return enn.FieldType(
             self.group,
-            4 * [self.group.irrep(1)] # pos, rot
-            + 2 * [self.group.trivial_repr], # gripper (2), z zpos
+            4 * [self.group.irrep(1)] # 8
+            + 2 * [self.group.trivial_repr], # 2
         )
+    
+    def getJointGeometricTensor(self, obs):
+        ee_pos = obs['robot0_eef_pos'] # (bs, t, 3)
+        ee_quat = obs['robot0_eef_quat'] # (bs, t, 4)
+        ee_q = obs["robot0_gripper_qpos"] # (bs, t, 2)
+        
+        ee_rot = self.get6DRotation(ee_quat)
+        pos_xy = ee_pos[:, 0:2] # 2
+        pos_z = ee_pos[:, 2:3] # 1
+        joint_features = torch.cat(
+            [
+                pos_xy,
+                ee_rot[:, 0:1], # 1
+                ee_rot[:, 3:4], # 1
+                ee_rot[:, 1:2], # 1
+                ee_rot[:, 4:5], # 1
+                ee_rot[:, 2:3], # 1
+                ee_rot[:, 5:6], # 1
+                pos_z, # 1
+                ee_q, # 2
+            ],
+            dim=1
+        )
+
+        return enn.GeometricTensor(joint_features, self.getJointFieldType())
+
+    def getActionGeometricTensor(self, act):
+        batch_size, t, *_ = act.shape
+        xy = act[:, :, 0:2]
+        z = act[:, :, 2:3]
+        rot = act[:, :, 3:9]
+        g = act[:, :, 9:]
+
+        cat = torch.cat(
+            (
+                xy.reshape(batch_size, t, 2),
+                rot[:, :, 0].reshape(batch_size, t, 1),
+                rot[:, :, 3].reshape(batch_size, t, 1),
+                rot[:, :, 1].reshape(batch_size, t, 1),
+                rot[:, :, 4].reshape(batch_size, t, 1),
+                rot[:, :, 2].reshape(batch_size, t, 1),
+                rot[:, :, 5].reshape(batch_size, t, 1),
+                z.reshape(batch_size, t, 1),
+                g.reshape(batch_size, t, 1),
+            ),
+            dim=2,
+        )
+        
+        cat = rearrange(cat, "b t d -> (b t) d")  # (bs*t, d)
+        return enn.GeometricTensor(cat, self.getOutFieldType())
+
+class EquivariantDecoder(ModuleAttrMixin):
+    def __init__(self, backbones, transformer, num_queries, camera_names, N=8):
+        super().__init__()
+        self.N = N
+        self.camera_names = camera_names
+        self.transformer = transformer
+        self.group = gspaces.no_base_space(CyclicGroup(self.N))
+        self.image_group = gspaces.rot2dOnR2(N)
+        hidden_dim = transformer.d_model
+        self.token_type = enn.FieldType(self.group, hidden_dim * [self.group.regular_repr])
+        
+        self.action_head = enn.Linear(
+            self.token_type
+            , self.getOutFieldType())
+ 
+        self.query_embed = nn.Embedding(num_queries * N, hidden_dim)
+
+        self.backbones = nn.ModuleList(backbones)
+        self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
+
+        self.input_proj_robot_state = enn.Linear(
+            self.getJointFieldType(),
+            self.token_type,
+        )
+        self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
+        
+        self.additional_pos_embed = nn.Embedding(1 + N, hidden_dim)
+        
+    def get6DRotation(self, quat):
+        # data is in xyzw, but rotation transformer takes wxyz
+        return self.quaternion_to_sixd.forward(quat[:, [3, 0, 1, 2]]) 
+    
+    def getJointFieldType(self):
+        return enn.FieldType(
+            self.group,
+            4 * [self.group.irrep(1)] # pos 3, rot 6
+            + 3 * [self.group.trivial_repr], # gripper 1
+        ) 
+        
+    def getOutput(self, conv_out, bs):
+        conv_out = conv_out.tensor
+        xy = conv_out[:, 0:2]
+        cos1 = conv_out[:, 2:3]
+        sin1 = conv_out[:, 3:4]
+        cos2 = conv_out[:, 4:5]
+        sin2 = conv_out[:, 5:6]
+        cos3 = conv_out[:, 6:7]
+        sin3 = conv_out[:, 7:8]
+        z = conv_out[:, 8:9]
+        g = conv_out[:, 9:10]
+
+        action = torch.cat((xy, z, cos1, cos2, cos3, sin1, sin2, sin3, g), dim=1)
+        action = rearrange(action, "(b t) d -> b t d", b=bs, d=action.shape[1]) # (bs, N, d)
+        return action
+    
+    def forward(self, obs, image, latent_input):
+        """
+        image: batch, channel, height, width
+        latent_input: batch, hidden_dim
+        """
+        bs = image.shape[0]
+        # Image observation features and position embeddings
+        all_cam_features = []
+        all_cam_pos = []
+        for cam_id, (cam_name, is_equi) in enumerate(self.camera_names):
+            features, pos = self.backbones[cam_id](image[:, cam_id])
+            features = features[0] # take the last layer feature
+            pos = pos[0]
+            all_cam_features.append(self.input_proj(features))
+            all_cam_pos.append(pos)
+        # proprioception features
+        qpos_features = self.getJointGeometricTensor(obs)
+        proprio_input = self.input_proj_robot_state(qpos_features).tensor
+        proprio_input = rearrange(proprio_input, "b (n d) -> b n d", b=proprio_input.shape[0], n=self.N) # (bs, N, hidden_dim)
+
+        # fold camera dimension into width dimension
+        src = torch.cat(all_cam_features, axis=3)
+        pos = torch.cat(all_cam_pos, axis=3)
+        latent_input = latent_input.unsqueeze(1)
+        hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+        hs = rearrange(hs, "b (t n) d -> (b t) (n d)", b=bs, n=self.N) # (bs * N, hidden_dim)
+        hs = enn.GeometricTensor(hs, self.token_type) 
+        a_hat = self.action_head(hs)
+        a_hat = self.getOutput(a_hat, bs)
+        return a_hat
+    
+    def getOutFieldType(self):
+        return enn.FieldType(
+            self.group,
+            4 * [self.group.irrep(1)] # 8
+            + 2 * [self.group.trivial_repr], # 2
+        )
+
+    def getJointGeometricTensor(self, obs):
+        ee_pos = obs['robot0_eef_pos'] # (bs, t, 3)
+        ee_quat = obs['robot0_eef_quat'] # (bs, t, 4)
+        ee_q = obs["robot0_gripper_qpos"] # (bs, t, 2)
+        
+        ee_rot = self.get6DRotation(ee_quat)
+        pos_xy = ee_pos[:, 0:2] # 2
+        pos_z = ee_pos[:, 2:3] # 1
+
+        joint_features = torch.cat(
+            [
+                pos_xy,
+                ee_rot[:, 0:1], # 1
+                ee_rot[:, 3:4], # 1
+                ee_rot[:, 1:2], # 1
+                ee_rot[:, 4:5], # 1
+                ee_rot[:, 2:3], # 1
+                ee_rot[:, 5:6], # 1
+                pos_z, # 1
+                ee_q, # 2
+            ],
+            dim=1
+        )
+
+        return enn.GeometricTensor(joint_features, self.getJointFieldType())
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, N):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -113,32 +309,33 @@ class DETRVAE(nn.Module):
         self.camera_names = camera_names
         self.transformer = transformer
         self.encoder = encoder
+        self.N = N
         hidden_dim = transformer.d_model
-        self.action_head = nn.Linear(hidden_dim, 10)
-        self.is_pad_head = nn.Linear(hidden_dim, 1)
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        if backbones is not None:
-            self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
-            self.backbones = nn.ModuleList(backbones)
-            self.input_proj_robot_state = nn.Linear(9, hidden_dim)
-        else:
-            # input_dim = 14 + 7 # robot_state + env_state
-            self.input_proj_robot_state = nn.Linear(14, hidden_dim)
-            self.input_proj_env_state = nn.Linear(7, hidden_dim)
-            self.pos = torch.nn.Embedding(2, hidden_dim)
-            self.backbones = None
+        
+        self.equivariant_decoder = EquivariantDecoder(
+            backbones,
+            transformer,
+            num_queries=num_queries,
+            camera_names=camera_names,
+            N=N,
+        )
 
         # encoder extra parameters
         self.latent_dim = 32 # final size of latent z # TODO tune
-        self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
-        self.encoder_action_proj = nn.Linear(10, hidden_dim) # project action to embedding
-        self.encoder_joint_proj = nn.Linear(9, hidden_dim)  # project qpos to embedding
-        self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2) # project hidden state to latent std, var
-        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
+        self.equivariant_encoder = EquivariantEncoder(
+            encoder,
+            num_queries=num_queries,
+            hidden_dim=hidden_dim,
+            final_dim=self.latent_dim,
+            N=N,
+            initialize=True,
+        )
 
         # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
+        
+        
 
     def forward(self, qpos, image, env_state, actions=None, is_pad=None):
         """
@@ -148,60 +345,22 @@ class DETRVAE(nn.Module):
         actions: batch, seq, action_dim
         """
         is_training = actions is not None # train or val
-        bs, _ = qpos.shape
+        bs, *_ = image.shape
         ### Obtain latent z from action sequence
         if is_training:
-            # project action sequence to embedding dim, and concat with a CLS token
-            action_embed = self.encoder_action_proj(actions) # (bs, seq, hidden_dim)
-            qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)
-            qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)
-            cls_embed = self.cls_embed.weight # (1, hidden_dim)
-            cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1) # (bs, 1, hidden_dim)
-            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)
-            encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)
-            # do not mask cls token
-            cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device) # False: not a padding
-            is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)
-            # obtain position embedding
-            pos_embed = self.pos_table.clone().detach()
-            pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
-            # query model
-            encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
-            encoder_output = encoder_output[0] # take cls output only
-            latent_info = self.latent_proj(encoder_output)
-            mu = latent_info[:, :self.latent_dim]
-            logvar = latent_info[:, self.latent_dim:]
-            latent_sample = reparametrize(mu, logvar)
+            latent_sample, mu, logvar, is_pad = self.equivariant_encoder(qpos, action=actions)
             latent_input = self.latent_out_proj(latent_sample)
         else:
             mu = logvar = None
-            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
+            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(image.device)
             latent_input = self.latent_out_proj(latent_sample)
 
-        if self.backbones is not None:
-            # Image observation features and position embeddings
-            all_cam_features = []
-            all_cam_pos = []
-            for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[cam_id](image[:, cam_id])
-                features = features[0] # take the last layer feature
-                pos = pos[0]
-                all_cam_features.append(self.input_proj(features))
-                all_cam_pos.append(pos)
-            # proprioception features
-            proprio_input = self.input_proj_robot_state(qpos)
-            # fold camera dimension into width dimension
-            src = torch.cat(all_cam_features, axis=3)
-            pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
-        else:
-            qpos = self.input_proj_robot_state(qpos)
-            env_state = self.input_proj_env_state(env_state)
-            transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
-            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
-        a_hat = self.action_head(hs)
-        is_pad_hat = self.is_pad_head(hs)
-        return a_hat, is_pad_hat, [mu, logvar]
+        a_hat = self.equivariant_decoder(
+            obs=qpos, 
+            image=image, 
+            latent_input=latent_input, 
+        )
+        return a_hat, None, [mu, logvar]
 
 
 
@@ -297,11 +456,21 @@ def build(args):
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
+    
     backbones = []
-    for _ in args.camera_names:
-        backbone = build_backbone(args)
+    new_camera_names = []
+    for cam_nam in args.camera_names:
+        if cam_nam in args.camera_equi:
+            print("build backbone equi", cam_nam)
+            backbone = build_backbone_equi(args)
+            new_camera_names.append([cam_nam , 1])
+        else:
+            print("build backbone", cam_nam)
+            backbone = build_backbone(args)
+            new_camera_names.append([cam_nam , 0])
         backbones.append(backbone)
-
+            
+    print(len(backbones))
     transformer = build_transformer(args)
 
     encoder = build_encoder(args)
@@ -312,7 +481,8 @@ def build(args):
         encoder,
         state_dim=state_dim,
         num_queries=args.num_queries,
-        camera_names=args.camera_names,
+        camera_names=new_camera_names,
+        N=args.N,  # number of groups
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -2,14 +2,14 @@ import torch.nn as nn
 from torch.nn import functional as F
 import torchvision.transforms as transforms
 
-from equi_diffpo.model.detr.main import build_ACT_model_and_optimizer, build_CNNMLP_model_and_optimizer
+from equi_diffpo.model.detr.main import build_ACT_equi_model_and_optimizer, build_CNNMLP_model_and_optimizer
 import IPython
 e = IPython.embed
 
 class ACTPolicy(nn.Module):
     def __init__(self, args_override):
         super().__init__()
-        model, optimizer = build_ACT_model_and_optimizer(args_override)
+        model, optimizer = build_ACT_equi_model_and_optimizer(args_override)
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
@@ -99,8 +99,6 @@ class ACTPolicyWrapper(BaseImagePolicy):
                  temporal_agg: bool,
                  n_envs: int,
                  horizon: int=10,
-                 N=8,
-                 enc_n_hidden=64,
                  n_groups=8,
                  ):
         super().__init__()
@@ -126,6 +124,7 @@ class ACTPolicyWrapper(BaseImagePolicy):
                         'dec_layers': dec_layers,
                         'nheads': nheads,
                         'camera_names': ['agentview_image', 'robot0_eye_in_hand_image'],
+                        'camera_equi': ['agentview_image'],
 
                         "weight_decay": 1e-4,
                         "dilation": False,
@@ -133,9 +132,7 @@ class ACTPolicyWrapper(BaseImagePolicy):
                         "dropout": 0.1,
                         "pre_norm": False,
                         "masks": False,
-                        "N": N,
-                        "enc_n_hidden": enc_n_hidden,
-                        "n_groups": n_groups,
+                        "N": n_groups,
                         }
         self.model = ACTPolicy(policy_config)
         self.optimizer = self.model.configure_optimizers()
@@ -167,9 +164,11 @@ class ACTPolicyWrapper(BaseImagePolicy):
         # nobs_dict = self.normalizer(obs_dict)
         nobs_dict = dict_apply(obs_dict, lambda x: x[:,0,...])
         # sixd = self.quat_to_sixd.forward(nobs_dict['robot0_eef_quat'])
+        image = torch.stack([nobs_dict['agentview_image'], nobs_dict['robot0_eye_in_hand_image']], dim=1)
+        
         if self.temporal_agg:
             if self.t % self.query_frequency == 0:
-                all_actions = self.model(nobs_dict)
+                all_actions = self.model(nobs_dict, image)
                 self.all_actions = all_actions
             else:
                 all_actions = self.all_actions
@@ -210,7 +209,7 @@ class ACTPolicyWrapper(BaseImagePolicy):
             }
 
         else:
-            raw_action = self.model(nobs_dict)
+            raw_action = self.model(nobs_dict, image)
             action = self.normalizer['action'].unnormalize(raw_action)
             result = {
                 'action': action # (B, 1, Da)
@@ -229,7 +228,7 @@ class ACTPolicyWrapper(BaseImagePolicy):
         nobs_dict = dict_apply(nobs_dict, lambda x: x[:,0,...])
         # sixd = self.quat_to_sixd.forward(nobs_dict['robot0_eef_quat'])
         # qpos = torch.cat([nobs_dict['robot0_eef_pos'], nobs_dict['robot0_eef_quat'], nobs_dict['robot0_gripper_qpos']], dim=1)
-        # image = torch.stack([nobs_dict['agentview_image'], nobs_dict['robot0_eye_in_hand_image']], dim=1)
+        image = torch.stack([nobs_dict['agentview_image'], nobs_dict['robot0_eye_in_hand_image']], dim=1)
 
-        forward_dict = self.model(nobs_dict, nactions, torch.zeros([*nactions.shape[:2]]).bool().to(self.device))
+        forward_dict = self.model(nobs_dict, image, nactions, torch.zeros([*nactions.shape[:2]]).bool().to(self.device))
         return forward_dict['loss']
