@@ -189,12 +189,7 @@ class EquivariantDecoder(ModuleAttrMixin):
             , self.getOutFieldType())
  
 
-        # Better: Make query embeddings equivariant
-        self.query_embed_base = nn.Embedding(num_queries, hidden_dim)
-        self.query_proj = enn.Linear(
-            self.query_type,
-            self.token_type
-        )
+        self.query_embed = nn.Embedding(num_queries * N, hidden_dim)
 
         self.backbones = nn.ModuleList(backbones)
         self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
@@ -258,13 +253,8 @@ class EquivariantDecoder(ModuleAttrMixin):
         src = torch.cat(all_cam_features, axis=3)
         pos = torch.cat(all_cam_pos, axis=3)
         latent_input = latent_input.unsqueeze(1)
-        query_embed = self.query_proj(
-            enn.GeometricTensor(self.query_embed_base.weight, self.query_type)
-        ).tensor
-        
-        query_embed = rearrange(query_embed, "b (n d) -> (b n) d", b=query_embed.shape[0], n=self.N) # (bs* N, hidden_dim)
-        
-        hs = self.transformer(src, None, query_embed, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+
+        hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
         hs = rearrange(hs, "b (t n) d -> (b t) (n d)", b=bs, n=self.N) # (bs * N, hidden_dim)
         hs = enn.GeometricTensor(hs, self.token_type) 
         a_hat = self.action_head(hs)
